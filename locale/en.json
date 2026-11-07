@@ -26,6 +26,8 @@
     "temperature": "Randomness (temperature)",
     "maxTokens": "Max output tokens (maxTokens)",
     "timeout": "Timeout (milliseconds)",
+    "contextTurns": "Recent turns as context",
+    "contextTurnsHint": "0 = off; 1–10 attaches the last few user and assistant messages. Read-only; ignored on failure.",
     "systemPrompt": "Meta-prompt (how the model should rewrite the draft)",
     "reset": "Restore defaults",
     "save": "Save",

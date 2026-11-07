@@ -17,6 +17,9 @@
 
 const name = 'prompt-enhancer'
 
+// `sessionQuery` is deliberately absent: the context feature degrades to
+// "no context" when the service is missing, so a profile without it can still
+// activate this plugin.
 const inject = ['llm', 'agentDefaultModel', 'webServer', 'configEditor']
 
 const ENHANCE_PATH = '/api/prompt-enhancer/enhance'
@@ -24,6 +27,10 @@ const CONFIG_PATH = '/api/prompt-enhancer/config'
 
 /** Bodies above this size are refused before JSON parsing. */
 const MAX_BODY_BYTES = 64 * 1024
+
+/** Per-message and total caps for optional conversation context. */
+const CONTEXT_MESSAGE_CHARS = 600
+const CONTEXT_TOTAL_CHARS = 2400
 
 /** Built-in defaults; the patch row carries the same values so users can edit them in cordis.patch.yml. */
 const DEFAULTS = {
@@ -35,27 +42,41 @@ const DEFAULTS = {
   // on step-5-preview. 4096 leaves room for both.
   maxTokens: 4096,
   timeoutMs: 30000,
-  systemPrompt: `你是提示词工程专家。把用户的草稿改写成更清晰、更具体、更可执行的提示词，保持其原始意图、语言和约束不变。
+  // 0 = off. 1..10 = attach the last N user/assistant messages as context.
+  contextTurns: 0,
+  systemPrompt: `你是提示词润色助手。你把用户的草稿轻度改写成更清晰、更可执行的提示词——像帮朋友把意思说明白，而不是替他写一份规格文档。
 
-规则：
-1. 语言保持是最高优先级：用户用什么语言就用什么语言输出（中文进中文出，英文进英文出，混排保持混排），不得在输出中添加任何语言分析或标签。
-2. 只输出增强后的提示词本身：不要解释、开场白、markdown 围栏、标签或包裹引号。
-3. 保留用户原始意图、主题、约束和期望的输出形式；不要代答问题，只改写问题。
-4. 做实质性增强：厘清任务、范围、约束和期望输出；原文已清晰时做轻度润色，不要原样返回。
-5. 完整而简洁（约 300–600 字），不得以未完成的列表、悬空连词或冒号结尾。
-6. 不添加无关要求、未经事实支持的内容或不必要的章节。
-7. 增强后的提示词只输出一次，不得重复或追加第二份。
+铁律：
+1. 保守第一：尽量保留用户的原句、用词和语气，只做必要的澄清与补全。
+2. 长度克制：增强后的提示词通常不超过原文长度的 2 倍；原文很短时，输出也必须很短——十几个字的草稿，改写成一两句话即可。绝不把短草稿膨胀成结构化规格。
+3. 不编造：不添加用户没有提过的具体信息——不指定技术栈、不编造数字、不补充需求清单、不添加验收标准。只澄清用户已经表达的意思。
+4. 语言保持：用户用什么语言就用什么语言输出（中文进中文出，英文进英文出，混排保持混排），不得在输出中添加任何语言分析或标签。
+5. 只输出增强后的提示词本身：不要解释、开场白、markdown 围栏、标签或包裹引号。
+6. 不代答：用户是在提请求，不是让你回答；只改写请求本身。
+7. 如果原文已经清晰，只做最小改动的润色，不要为了改而改。
 
-示例：
+示例（注意输出与输入的长度比例）：
 用户输入：帮我写个登录页
-增强后：请实现一个登录页面，包含账号与密码输入、基础格式校验、错误提示以及登录成功后的跳转；未指定技术栈时使用项目现有栈，并说明需要覆盖的失败状态。`,
+增强后：帮我写一个登录页，说明技术栈和要实现的功能。
+
+用户输入：把这个 bug 修一下
+增强后：帮我修复这个 bug，先分析原因再给出修改。
+
+用户输入：帮我把周报写了，这周做了登录模块和支付联调
+增强后：帮我把本周周报写了，本周完成了登录模块开发和支付渠道联调，请分条概括进展、问题与下周计划。`,
 }
 
-/** User wrapper; `{input}` is the draft being enhanced. */
-const USER_TEMPLATE = `USER INPUT:
+/** User wrapper; `{input}` is the draft being enhanced, `{context}` the optional recent conversation. */
+const USER_TEMPLATE = `{context}USER INPUT:
 {input}
 
-TASK: Rewrite the user input above into an enhanced prompt, following the rules in your instructions. Reply with the enhanced prompt only — no explanations, prefaces, quotes, or markdown fences. Match the input language exactly. Do not answer the request; rewrite it.`
+TASK: Lightly rewrite the user input above into a clearer, more actionable prompt, following the rules in your instructions. Stay close to the original wording and length — never expand a short draft into a specification. Reply with the enhanced prompt only. Match the input language exactly. Do not answer the request; rewrite it.`
+
+/** Optional context block, placed ahead of the draft so the model reads it first. */
+const CONTEXT_TEMPLATE = `RECENT CONVERSATION (context only — never repeat, summarize, or mention it in your output):
+{context}
+
+`
 
 /** Clamp a number into range, falling back to the default for junk. */
 function clampNumber(value, fallback, min, max) {
@@ -76,6 +97,7 @@ function normalizeConfig(raw) {
     temperature: clampNumber(source.temperature, DEFAULTS.temperature, 0, 2),
     maxTokens: Math.round(clampNumber(source.maxTokens, DEFAULTS.maxTokens, 1, 8192)),
     timeoutMs,
+    contextTurns: Math.round(clampNumber(source.contextTurns, DEFAULTS.contextTurns, 0, 10)),
     systemPrompt: typeof source.systemPrompt === 'string' && source.systemPrompt.trim() !== ''
       ? source.systemPrompt
       : DEFAULTS.systemPrompt,
@@ -91,6 +113,90 @@ function parseModelSpec(spec) {
   const model = spec.slice(at + 1)
   if (/\s/.test(provider) || /\s/.test(model)) return null
   return { provider, model }
+}
+
+/**
+ * Visible text of one message's content blocks. Only `text` blocks carry
+ * prompt text; reasoning, image, file, and tool blocks are not context a
+ * rewrite should see.
+ */
+function contentText(blocks) {
+  return blocks
+    .map((block) => (block.type === 'text' ? block.text : ''))
+    .filter((text) => text !== '')
+    .join('\n')
+}
+
+/**
+ * 'user' | 'assistant' | null.
+ *
+ * `readSurface` returns `SurfaceEvent[]`, a closed union keyed by `type`
+ * (`SessionEventMap`): `user/message` data is the `UserMessage` itself, every
+ * other variant wraps its message in `data.message`. System prompts, developer
+ * context, and tool results are not conversation context, so only the two chat
+ * roles survive.
+ */
+function eventRole(event) {
+  if (event.type === 'user/message') return 'user'
+  if (event.type === 'assistant/message') return 'assistant'
+  return null
+}
+
+/** The message a surface event carries, or null for the non-chat variants. */
+function eventMessage(event) {
+  return event.type === 'user/message' ? event.data : event.data.message
+}
+
+/**
+ * The last `turns` user/assistant messages from a session surface, oldest
+ * first, each message and the total capped so a long reply cannot eat the
+ * rewrite budget. An unreadable surface yields no context rather than an
+ * error, and the rewrite proceeds without it.
+ */
+function extractRecentMessages(events, turns) {
+  if (!Array.isArray(events) || turns <= 0) return []
+  const picked = []
+  for (let i = events.length - 1; i >= 0 && picked.length < turns * 2; i -= 1) {
+    const event = events[i]
+    const role = eventRole(event)
+    if (role === null) continue
+    const text = contentText(eventMessage(event).content)
+      .trim()
+      .slice(0, CONTEXT_MESSAGE_CHARS)
+    if (text === '') continue
+    picked.unshift({ role, text })
+  }
+  let total = 0
+  const capped = []
+  for (let i = picked.length - 1; i >= 0; i -= 1) {
+    const message = picked[i]
+    if (total + message.text.length > CONTEXT_TOTAL_CHARS) break
+    total += message.text.length
+    capped.unshift(message)
+  }
+  return capped
+}
+
+/** Read recent context for one session; any failure means "no context". */
+async function readRecentContext(ctx, sessionId, turns) {
+  if (turns <= 0 || typeof sessionId !== 'string' || sessionId === '') return []
+  const query = ctx.get('sessionQuery') ?? ctx.sessionQuery
+  if (query === undefined || typeof query.readSurface !== 'function') return []
+  try {
+    const surface = await query.readSurface(sessionId)
+    return extractRecentMessages(surface?.events, turns)
+  } catch {
+    return []
+  }
+}
+
+/** Render the context block; the labels are instructions to the model, not output. */
+function renderContext(messages) {
+  if (messages.length === 0) return ''
+  const body = messages
+    .map((message) => `${message.role === 'user' ? '用户' : '助手'}：${message.text}`)
+    .join('\n\n')
+  return CONTEXT_TEMPLATE.replace('{context}', body)
 }
 
 /** The model an enhancement call would use right now, and where it came from. */
@@ -168,8 +274,8 @@ async function fastestEffort(ctx, selection, signal) {
   }
 }
 
-/** One enhancement call. Returns { ok, text } or { ok: false, error, status }. */
-async function executeEnhance(ctx, resolved, input, signal) {
+/** One enhancement call. Returns { ok, text, contextMessages } or { ok: false, error, status }. */
+async function executeEnhance(ctx, resolved, input, signal, sessionId) {
   const selection = effectiveSelection(ctx, resolved)
   if (selection === null) {
     return {
@@ -179,13 +285,22 @@ async function executeEnhance(ctx, resolved, input, signal) {
     }
   }
   try {
+    const context = await readRecentContext(ctx, sessionId, resolved.contextTurns)
     const reasoningEffort = await fastestEffort(ctx, selection, signal)
     const stream = ctx.llm.stream({
       provider: selection.provider,
       model: selection.model,
       ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
       system: resolved.systemPrompt,
-      messages: [{ role: 'user', content: [{ type: 'text', text: USER_TEMPLATE.replace('{input}', input) }] }],
+      messages: [{
+        role: 'user',
+        content: [{
+          type: 'text',
+          text: USER_TEMPLATE
+            .replace('{context}', renderContext(context))
+            .replace('{input}', input),
+        }],
+      }],
       temperature: resolved.temperature,
       maxTokens: resolved.maxTokens,
       signal,
@@ -203,7 +318,7 @@ async function executeEnhance(ctx, resolved, input, signal) {
         error: `模型 ${selection.provider}/${selection.model} 返回了空结果${detail}，草稿没有变化。若该模型带推理能力，请调大 maxTokens——隐藏思考与可见回答共用同一配额。`,
       }
     }
-    return { ok: true, text: enhanced }
+    return { ok: true, text: enhanced, contextMessages: context.length }
   } catch (error) {
     if (signal?.aborted) return { ok: false, error: '已取消' }
     const message = error instanceof Error ? error.message : String(error)
@@ -293,6 +408,11 @@ function validateConfigPatch(payload) {
     if (!Number.isInteger(n) || n < 1000 || n > 120000) return { ok: false, error: 'timeoutMs 需要在 1000 到 120000 之间的整数' }
     next.timeoutMs = n
   }
+  if ('contextTurns' in payload) {
+    const n = Number(payload.contextTurns)
+    if (!Number.isInteger(n) || n < 0 || n > 10) return { ok: false, error: 'contextTurns 需要在 0 到 10 之间的整数（0 = 不附带上下文）' }
+    next.contextTurns = n
+  }
   if ('systemPrompt' in payload) {
     if (typeof payload.systemPrompt !== 'string' || payload.systemPrompt.trim() === '') {
       return { ok: false, error: 'systemPrompt 不能为空' }
@@ -353,12 +473,15 @@ function apply(ctx, config) {
         sendJson(res, 400, { error: '先输入内容，再增强提示词' })
         return
       }
-      const outcome = await executeEnhance(ctx, resolved, input, AbortSignal.timeout(resolved.timeoutMs))
+      // The composer button sends the session it is composing in; without it
+      // the context feature has nothing to read and stays off.
+      const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : ''
+      const outcome = await executeEnhance(ctx, resolved, input, AbortSignal.timeout(resolved.timeoutMs), sessionId)
       if (!outcome.ok) {
         sendJson(res, outcome.status ?? 502, { error: outcome.error })
         return
       }
-      sendJson(res, 200, { text: outcome.text })
+      sendJson(res, 200, { text: outcome.text, contextMessages: outcome.contextMessages })
     },
   }), 'prompt-enhancer enhance route')
 

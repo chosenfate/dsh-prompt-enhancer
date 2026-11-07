@@ -31,6 +31,7 @@ const BASE_CONFIG = {
   temperature: 0.2,
   maxTokens: 4096,
   timeoutMs: 30000,
+  contextTurns: 0,
   systemPrompt: "你是提示词工程专家。",
 };
 
@@ -153,7 +154,7 @@ function renderInto(Component, props, { mount: fresh = true } = {}) {
   return { tree, cleanups };
 }
 
-function buttonProps(state, sink) {
+function buttonProps(state, sink, sessionId) {
   return {
     useInput: (select) => select({ draft: state.draft, phase: state.phase, occurrences: state.occurrences }),
     inputActions: {
@@ -162,18 +163,19 @@ function buttonProps(state, sink) {
         state.draft = next;
       },
     },
+    sessionId,
   };
 }
 
-function mountButton(client, { draft = "", phase = "plain", occurrences = [], writes } = {}) {
+function mountButton(client, { draft = "", phase = "plain", occurrences = [], writes, sessionId } = {}) {
   const sink = writes ?? [];
   const state = { draft, phase, occurrences };
-  const view = renderInto(client.components["conversation.input.right"], buttonProps(state, sink), { mount: true });
-  return { ...view, state, sink };
+  const view = renderInto(client.components["conversation.input.right"], buttonProps(state, sink, sessionId), { mount: true });
+  return { ...view, state, sink, sessionId };
 }
 
 function rerenderButton(client, view) {
-  const rendered = renderInto(client.components["conversation.input.right"], buttonProps(view.state, view.sink), { mount: false });
+  const rendered = renderInto(client.components["conversation.input.right"], buttonProps(view.state, view.sink, view.sessionId), { mount: false });
   return { ...view, ...rendered };
 }
 
@@ -366,6 +368,18 @@ test("successful rewrite posts the draft text and replaces it", async () => {
   assert.deepEqual(view.state.draft, "增强后的提示词");
 });
 
+test("the enhance request carries the session id the composer provides", async () => {
+  const calls = mockApi({ onEnhance: () => ({ ok: true, status: 200, json: async () => ({ text: "增强后的提示词" }) }) });
+  const client = loadClient();
+  const view = mountButton(client, { draft: "帮我写个登录页", sessionId: "sess-1" });
+  await tick();
+  await byClass(view.tree, "dshEnhance_button").props.onClick();
+  await tick();
+  const body = JSON.parse(calls.find((c) => c.url === ENHANCE_PATH).init.body);
+  assert.equal(body.sessionId, "sess-1", "the host needs the session id to read the recent turns");
+  assert.equal(body.input, "帮我写个登录页");
+});
+
 test("after a rewrite the button becomes 恢复原文 and reverts on click", async () => {
   mockApi({ onEnhance: () => ({ ok: true, status: 200, json: async () => ({ text: "改写后" }) }) });
   const client = loadClient();
@@ -549,8 +563,12 @@ test("the settings page renders the effective config from the host", async () =>
   await tick();
   const loaded = rerenderSettings(client, view);
   const numbers = inputsOfType(loaded.tree, "number");
-  assert.equal(numbers.length, 3, "temperature, maxTokens and timeoutMs inputs");
+  assert.equal(numbers.length, 4, "temperature, maxTokens, timeoutMs and contextTurns inputs");
   assert.equal(numbers[0].props.value, "0.7");
+  const contextTurns = numbers[3];
+  assert.equal(contextTurns.props.value, "0", "context turns default to off");
+  assert.equal(contextTurns.props.min, "0");
+  assert.equal(contextTurns.props.max, "10");
   const radios = inputsOfType(loaded.tree, "radio");
   assert.equal(radios.length, 2);
   assert.equal(radios[0].props.checked, false, "a configured model selects 指定模型");
@@ -583,7 +601,29 @@ test("the settings page saves the merged config", async () => {
   assert.equal(body.temperature, 0.2);
   assert.equal(body.maxTokens, 4096);
   assert.equal(body.timeoutMs, 30000);
+  assert.equal(body.contextTurns, 0);
   assert.equal(body.systemPrompt, BASE_CONFIG.systemPrompt);
+});
+
+test("editing the context turns field posts the new value", async () => {
+  const calls = mockApi({
+    config: { ...BASE_CONFIG },
+    onSave: (body) => ({ ok: true, status: 200, json: async () => ({ ok: true, saved: body }) }),
+  });
+  const client = loadClient();
+  const view = mountSettings(client);
+  await tick();
+  const loaded = rerenderSettings(client, view);
+  const contextTurns = inputsOfType(loaded.tree, "number")[3];
+  assert.ok(contextTurns !== undefined, "the context turns input must render");
+  await contextTurns.props.onChange({ target: { value: "4" } });
+  const edited = rerenderSettings(client, loaded);
+  await byClass(edited.tree, "dshEnhance_primary").props.onClick();
+  await tick();
+  const saveCalls = calls.filter((c) => c.url === CONFIG_PATH && c.method === "POST");
+  assert.equal(saveCalls.length, 1);
+  const body = JSON.parse(saveCalls[0].init.body);
+  assert.equal(body.contextTurns, 4, "the edited value must reach the host as a number");
 });
 
 test("the settings page refuses a half-typed model without calling the host", async () => {

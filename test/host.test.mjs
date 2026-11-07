@@ -2,8 +2,8 @@
  * Host-half tests for index.js.
  *
  * A fake cordis context stands in for llm, agentDefaultModel, webServer,
- * configEditor and effect, so the rewrite pipeline and the config routes can
- * be exercised without a running harness.
+ * configEditor, the optional sessionQuery service, and effect, so the rewrite
+ * pipeline and the config routes can be exercised without a running harness.
  *
  *   node --test test/host.test.mjs
  */
@@ -36,10 +36,68 @@ const BASE_CONFIG = {
   temperature: 0.2,
   maxTokens: 4096,
   timeoutMs: 30000,
+  contextTurns: 0,
   systemPrompt: "你是提示词工程专家。",
 };
 
-function makeCtx({ text = "改写结果", selection = { provider: "p", model: "m" }, efforts, config = {}, editorMissing = false } = {}) {
+// ------------------------------------------------------------ surface fixture
+// Shaped like the real contract: `readSurface` resolves a
+// `SessionSurfaceSnapshot` whose `events` are `SurfaceEvent`s from the closed
+// `SessionEventMap` union — `user/message` carries the `UserMessage` itself as
+// `data`, every other variant wraps its message in `data.message`.
+
+const SESSION_HEADER = { version: 1, id: "sess-1", createdAt: 1760000000000, isSeeded: false };
+
+const surfaceEvent = (seq, type, data) => ({ type, seq, time: 1760000000000 + seq, surfaceOp: "append", data });
+
+const userEvent = (seq, text) => surfaceEvent(seq, "user/message", {
+  id: `m${seq}`,
+  role: "user",
+  source: { kind: "user" },
+  content: [{ type: "text", text }],
+});
+
+const assistantEvent = (seq, text) => surfaceEvent(seq, "assistant/message", {
+  turn: 1,
+  step: 0,
+  message: {
+    id: `m${seq}`,
+    role: "assistant",
+    source: { kind: "model", provider: "p", model: "m" },
+    content: [{ type: "text", text }],
+  },
+  stream: [],
+});
+
+/** Four chat messages, plus the non-chat variants a real surface also carries. */
+const RECENT_SURFACE = [
+  surfaceEvent(1, "system/message", {
+    turn: 0,
+    step: 0,
+    message: { id: "s1", role: "system", source: { kind: "system-prompt" }, content: [{ type: "text", text: "系统提示词不是对话上下文" }] },
+  }),
+  userEvent(2, "第一轮：帮我看看登录为什么报错"),
+  assistantEvent(3, "先看错误堆栈，再定位配置。"),
+  surfaceEvent(4, "tool/result", {
+    turn: 1,
+    step: 1,
+    message: { id: "t4", role: "tool", source: { kind: "tool", name: "read_file" }, toolCallId: "c1", content: [{ type: "text", text: "文件内容不是对话上下文" }] },
+  }),
+  userEvent(5, "堆栈显示是 token 过期"),
+  assistantEvent(6, "那把刷新逻辑加上。"),
+];
+
+const snapshotOf = (events) => ({ session: SESSION_HEADER, inheritedEventCount: 0, capturedThroughSeq: null, events });
+
+function makeCtx({
+  text = "改写结果",
+  selection = { provider: "p", model: "m" },
+  efforts,
+  config = {},
+  editorMissing = false,
+  surface,
+  surfaceError = false,
+} = {}) {
   const routes = {};
   const seen = {};
   const edits = [];
@@ -68,7 +126,7 @@ function makeCtx({ text = "改写结果", selection = { provider: "p", model: "m
     fiber: { entry: { id: "prompt-enhancer" } },
     get(name) {
       if (name === "configEditor") return editorMissing ? undefined : ctx.configEditor;
-      return undefined;
+      return ctx[name];
     },
     configEditor: editorMissing ? undefined : {
       async edit(entry, change) {
@@ -84,6 +142,18 @@ function makeCtx({ text = "改写结果", selection = { provider: "p", model: "m
     routes,
     edits,
   };
+  // `sessionQuery` is optional: a profile without it must still activate the
+  // plugin, so only the cases that need a surface install the fake service.
+  if (surface !== undefined || surfaceError) {
+    ctx.sessionQuery = {
+      calls: [],
+      async readSurface(sessionId) {
+        this.calls.push(sessionId);
+        if (surfaceError) throw new Error("SESSION_QUERY_CORRUPT_SESSION");
+        return snapshotOf(surface);
+      },
+    };
+  }
   ctx.__config = { ...BASE_CONFIG, ...config };
   return ctx;
 }
@@ -309,7 +379,71 @@ test("the enhance signal is bounded by the configured timeout", async () => {
   assert.equal(signal.aborted, false);
 });
 
+// ------------------------------------------------------------------- context
+
+test("contextTurns > 0 attaches the recent conversation ahead of the draft", async () => {
+  const ctx = makeCtx({ config: { contextTurns: 2 }, surface: RECENT_SURFACE });
+  mod.apply(ctx, ctx.__config);
+  const { status, json } = await enhance(ctx, { payload: { input: "那刷新逻辑怎么写", sessionId: "sess-1" } });
+  assert.equal(status, 200);
+  assert.equal(json.contextMessages, 4, "two turns of chat, oldest first");
+  assert.deepEqual(ctx.sessionQuery.calls, ["sess-1"], "the surface is read once, for the composing session");
+  const userText = ctx.seen.stream.messages[0].content[0].text;
+  assert.ok(userText.includes("RECENT CONVERSATION"), "the context block must precede the draft");
+  assert.ok(userText.indexOf("RECENT CONVERSATION") < userText.indexOf("USER INPUT"));
+  assert.ok(userText.includes("堆栈显示是 token 过期"), "the newest messages survive");
+  assert.ok(userText.includes("第一轮：帮我看看登录为什么报错"), "older messages fill the remaining turns");
+  assert.ok(!userText.includes("系统提示词不是对话上下文"), "system prompts are not conversation context");
+  assert.ok(!userText.includes("文件内容不是对话上下文"), "tool results are not conversation context");
+});
+
+test("contextTurns = 0 reads no surface and sends no context", async () => {
+  const ctx = makeCtx({ surface: RECENT_SURFACE }); // BASE_CONFIG carries contextTurns: 0
+  mod.apply(ctx, ctx.__config);
+  const { json } = await enhance(ctx, { payload: { input: "写个登录页", sessionId: "sess-1" } });
+  assert.equal(json.contextMessages, 0);
+  assert.equal(ctx.sessionQuery.calls.length, 0, "an off switch must cost nothing");
+  assert.ok(!ctx.seen.stream.messages[0].content[0].text.includes("RECENT CONVERSATION"));
+});
+
+test("a missing session id leaves the context off", async () => {
+  const ctx = makeCtx({ config: { contextTurns: 3 }, surface: RECENT_SURFACE });
+  mod.apply(ctx, ctx.__config);
+  const { json } = await enhance(ctx, { payload: { input: "写个登录页" } });
+  assert.equal(json.contextMessages, 0);
+  assert.equal(ctx.sessionQuery.calls.length, 0, "without a session there is nothing to read");
+});
+
+test("an unreadable surface degrades to no context, the rewrite still lands", async () => {
+  const ctx = makeCtx({ config: { contextTurns: 2 }, surfaceError: true });
+  mod.apply(ctx, ctx.__config);
+  const { status, json } = await enhance(ctx, { payload: { input: "写个登录页", sessionId: "sess-1" } });
+  assert.equal(status, 200);
+  assert.equal(json.text, "改写结果");
+  assert.equal(json.contextMessages, 0);
+  assert.ok(!ctx.seen.stream.messages[0].content[0].text.includes("RECENT CONVERSATION"));
+});
+
+test("a profile without the sessionQuery service still enhances", async () => {
+  const ctx = makeCtx({ config: { contextTurns: 2 } }); // no sessionQuery installed at all
+  mod.apply(ctx, ctx.__config);
+  const { status, json } = await enhance(ctx, { payload: { input: "写个登录页", sessionId: "sess-1" } });
+  assert.equal(status, 200);
+  assert.equal(json.contextMessages, 0);
+});
+
 // -------------------------------------------------------------------- config
+
+test("the default system prompt asks for a conservative, length-aware rewrite", async () => {
+  const ctx = makeCtx({ config: { systemPrompt: "   " } }); // blank falls back to the default
+  mod.apply(ctx, ctx.__config);
+  const { json } = await configRoute(ctx, { method: "GET" });
+  const prompt = json.defaults.systemPrompt;
+  assert.ok(prompt.includes("保守第一"), "staying close to the user's wording comes first");
+  assert.ok(prompt.includes("长度克制"), "the output length must stay bounded");
+  assert.ok(prompt.includes("不编造"), "no invented stack, numbers, or requirements");
+  assert.ok(!prompt.includes("实质性增强"), "the old heavy-rewrite wording is gone");
+});
 
 test("GET config returns the effective config, defaults, and the model in use", async () => {
   const ctx = makeCtx();
@@ -336,12 +470,13 @@ test("GET config reports null when no model is available at all", async () => {
 });
 
 test("a junk row config is clamped into range instead of throwing", async () => {
-  const ctx = makeCtx({ config: { temperature: 99, maxTokens: -5, timeoutMs: 1, systemPrompt: "   ", enabled: "no" } });
+  const ctx = makeCtx({ config: { temperature: 99, maxTokens: -5, timeoutMs: 1, contextTurns: 99, systemPrompt: "   ", enabled: "no" } });
   mod.apply(ctx, ctx.__config);
   const { json } = await configRoute(ctx, { method: "GET" });
   assert.equal(json.config.temperature, 2);
   assert.equal(json.config.maxTokens, 1);
   assert.equal(json.config.timeoutMs, 1000);
+  assert.equal(json.config.contextTurns, 10, "contextTurns is clamped into 0..10");
   assert.ok(json.config.systemPrompt.length > 0, "an empty systemPrompt falls back to the default");
   assert.equal(json.config.enabled, false, 'enabled: "no" is not undefined, so it counts as off');
 });
@@ -349,7 +484,7 @@ test("a junk row config is clamped into range instead of throwing", async () => 
 test("POST config persists a valid patch through the config editor", async () => {
   const ctx = makeCtx();
   mod.apply(ctx, ctx.__config);
-  const { status, json } = await configRoute(ctx, { payload: { temperature: 0.5, model: "a/b", enabled: false } });
+  const { status, json } = await configRoute(ctx, { payload: { temperature: 0.5, model: "a/b", enabled: false, contextTurns: 3 } });
   assert.equal(status, 200);
   assert.equal(json.ok, true);
   assert.equal(ctx.edits.length, 1);
@@ -357,13 +492,14 @@ test("POST config persists a valid patch through the config editor", async () =>
   assert.equal(ctx.edits[0].next.temperature, 0.5);
   assert.equal(ctx.edits[0].next.model, "a/b");
   assert.equal(ctx.edits[0].next.enabled, false);
+  assert.equal(ctx.edits[0].next.contextTurns, 3);
   assert.equal(ctx.edits[0].next.systemPrompt, BASE_CONFIG.systemPrompt, "untouched fields survive the merge");
 });
 
 test("POST config rejects out-of-range and malformed values", async () => {
   const ctx = makeCtx();
   mod.apply(ctx, ctx.__config);
-  for (const payload of [{ temperature: 9 }, { maxTokens: 0 }, { timeoutMs: 10 }, { model: "no-slash" }, { systemPrompt: "" }, { enabled: "yes" }, {}]) {
+  for (const payload of [{ temperature: 9 }, { maxTokens: 0 }, { timeoutMs: 10 }, { model: "no-slash" }, { systemPrompt: "" }, { enabled: "yes" }, {}, { contextTurns: 11 }, { contextTurns: -1 }]) {
     const { status } = await configRoute(ctx, { payload });
     assert.equal(status, 400, `expected 400 for ${JSON.stringify(payload)}`);
   }

@@ -26,6 +26,8 @@
     "temperature": "随机性（temperature）",
     "maxTokens": "最大输出长度（maxTokens）",
     "timeout": "超时时间（毫秒）",
+    "contextTurns": "附带最近几轮对话",
+    "contextTurnsHint": "0 = 不附带；1–10 时增强会参考最近几轮用户与助手消息。只读当前会话，失败时自动忽略。",
     "systemPrompt": "元提示词（指导模型如何改写草稿）",
     "reset": "恢复默认",
     "save": "保存",
