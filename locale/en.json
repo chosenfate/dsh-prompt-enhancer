@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "title": "Prompt enhancer",
+    "description": "Rewrite the composer draft into a clearer, more specific prompt in one click: replaced in place with one-click restore; the enhancement model and meta-prompt are configurable in settings."
+  },
+  "button": {
+    "enhance": "Enhance prompt",
+    "enhancing": "Enhancing…",
+    "revert": "Restore original",
+    "empty": "Type something first, then enhance",
+    "busy": "Sending — enhancement is paused",
+    "hasRefs": "Drafts with file references can't be enhanced yet",
+    "tooLong": "Prompt too long (64 KB limit)",
+    "disabled": "Prompt enhancement is turned off",
+    "timeout": "Enhancement timed out; the draft is unchanged",
+    "failed": "Enhancement failed"
+  },
+  "settings": {
+    "title": "Prompt enhancer",
+    "enabled": "Enable the composer enhance button",
+    "model": "Enhancement model",
+    "follow": "Follow the session default model",
+    "specify": "Use a specific model",
+    "provider": "Provider",
+    "modelId": "Model ID",
+    "temperature": "Randomness (temperature)",
+    "maxTokens": "Max output tokens (maxTokens)",
+    "timeout": "Timeout (milliseconds)",
+    "systemPrompt": "Meta-prompt (how the model should rewrite the draft)",
+    "reset": "Restore defaults",
+    "save": "Save",
+    "saving": "Saving…",
+    "saved": "Saved",
+    "saveFailed": "Save failed",
+    "loading": "Loading…",
+    "loadFailed": "Failed to load settings",
+    "effective": "Effective model",
+    "none": "Not configured; enhancement will report that no model is available",
+    "invalid": "Some values are invalid; please check and retry"
+  }
+}

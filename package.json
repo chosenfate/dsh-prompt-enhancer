@@ -1,0 +1,68 @@
+{
+  "name": "@chosenfate/dsh-prompt-enhancer",
+  "version": "1.0.0",
+  "description": "在 DeepSeek Harness 输入栏一键把草稿改写成更清晰、更具体的提示词：原地替换、一键还原，增强模型与元提示词均可在设置页配置。",
+  "icon": "./icon.svg",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "deepseek-harness",
+    "cordis",
+    "prompt",
+    "prompt-engineering",
+    "prompt-enhance",
+    "composer",
+    "web-ui"
+  ],
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test test/host.test.mjs test/client.test.cjs",
+    "check:install": "node scripts/check-install.cjs .",
+    "release": "node scripts/release.cjs"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/client.js",
+    "cordis.patch.yml",
+    "locale/en.json",
+    "locale/zh.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "author": "chosenfate",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chosenfate/dsh-prompt-enhancer.git"
+  },
+  "homepage": "https://github.com/chosenfate/dsh-prompt-enhancer#readme",
+  "bugs": {
+    "url": "https://github.com/chosenfate/dsh-prompt-enhancer/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-rc.2 <0.3.0-0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  }
+}

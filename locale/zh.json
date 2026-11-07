@@ -1,0 +1,41 @@
+{
+  "meta": {
+    "title": "提示词增强",
+    "description": "在输入栏一键把草稿改写成更清晰、更具体的提示词：原地替换、一键还原，增强模型与元提示词均可在设置页配置。"
+  },
+  "button": {
+    "enhance": "增强提示词",
+    "enhancing": "增强中…",
+    "revert": "恢复原文",
+    "empty": "先输入内容，再增强提示词",
+    "busy": "发送中，暂不可增强",
+    "hasRefs": "草稿含文件引用，暂不支持增强",
+    "tooLong": "提示词太长（上限 64 KB）",
+    "disabled": "提示词增强已停用",
+    "timeout": "增强超时，原文未改动",
+    "failed": "增强失败"
+  },
+  "settings": {
+    "title": "提示词增强",
+    "enabled": "启用输入栏增强按钮",
+    "model": "增强用模型",
+    "follow": "跟随会话默认模型",
+    "specify": "指定模型",
+    "provider": "提供商",
+    "modelId": "模型 ID",
+    "temperature": "随机性（temperature）",
+    "maxTokens": "最大输出长度（maxTokens）",
+    "timeout": "超时时间（毫秒）",
+    "systemPrompt": "元提示词（指导模型如何改写草稿）",
+    "reset": "恢复默认",
+    "save": "保存",
+    "saving": "保存中…",
+    "saved": "已保存",
+    "saveFailed": "保存失败",
+    "loading": "读取中…",
+    "loadFailed": "读取配置失败",
+    "effective": "当前生效模型",
+    "none": "未配置，增强时会提示没有可用的模型",
+    "invalid": "配置值不合法，请检查后重试"
+  }
+}
